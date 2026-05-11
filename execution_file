@@ -1,0 +1,95 @@
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
+import datetime
+from datetime import datetime, timedelta
+from checkTrades import OrderTracker 
+import backtrader as bt
+import learning10_new
+import checkTrades as checkTrades, timeFilter, SPEC
+from numpy_liquidity import LiquidityScanner, LiquidityScanner_M15
+from backtrader import num2date
+from learning3_data import CandleData2
+import time
+import numpy as np
+from numpy_negation import NegationScanner, HCS_Scanner
+import numpy_permission
+from checkTrades import checkOrders
+from learning3_data import CandleData2
+import pandas as pd
+from collections import defaultdict
+from timeFilter import isTimeTrue
+
+# stoploss, takeprofit, and partial level sizes:
+class sharedState:
+
+    params_buy = dict(
+        lot_size=1.0,
+        stop_loss_18    = 0.0003303, # 3.3 pips
+        stop_loss_25    = 0.0003303,
+        stop_loss_spec  = 0.0003303,
+
+        offsets  = np.array([-0.0003303, 2.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0], dtype=float),
+        percents = np.array([ -1.0,      0.0, 0.15, 0.28, 0.28, 0.19,  0.1, 0.1], dtype=float),
+        rr       = np.array([ -1.0,      0.0,  2.0,  7.0, 13.5, 20.0, 25.5, 32.5], dtype=float),
+
+        take_profit=50.0,    # Default take profit in points
+    )
+
+    params_sell = dict(
+        lot_size=1.0,
+        stop_loss_18    = 0.0003303, # 3.3 pips
+        stop_loss_25    = 0.0003303,
+        stop_loss_spec  = 0.0003303,
+
+        offsets  = np.array([-0.0003303, 2.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0], dtype=float),
+        percents = np.array([ -1.0,      0.0, 0.15, 0.28, 0.28, 0.19,  0.1, 0.1], dtype=float),
+        rr       = np.array([ -1.0,      0.0,  2.0,  7.0, 13.5, 20.0, 25.5, 32.5], dtype=float),
+
+        take_profit=50.0,    # Default take profit in points
+    )
+
+
+class MasterStrategy(bt.Strategy):
+    def __init__(self):
+
+        self.shared = sharedState(
+            data=self.datas[0],
+            parent=self)
+        
+        data0 = self.datas[0]
+        symbol = data0._name
+        print(f"[INIT] MasterStrategy for symbol: {symbol}")
+        
+        self.buy_mgr = buyStrategy(
+            data=self.datas[0],
+            shared=self.shared,
+            parent=self
+            #offsets=shared.offsets,
+            #percents=self.shared.percents,
+            #risk_reward=self.shared.risk_reward
+        )
+
+        self.sell_mgr = sellStrategy(
+            data=self.datas[0],
+            shared=self.shared,
+            parent=self
+            #offsets=self.shared.offsets,
+            #percents=self.shared.percents,
+            #risk_reward=self.shared.risk_reward
+        )
+
+        # optionally, same for sell
+        # self.sell_mgr = sellStrategy(...)
+
+    def next(self):
+        # Just delegate to your managers:
+        dt = self.datas[0].datetime.datetime(0)
+        close = self.datas[0].close[0]
+
+        # only spam for EURUSD
+        if self.datas[0]._name == 'EURUSD':
+            print(f"[NEXT EURUSD] {dt} close={close}")
+
+        self.buy_mgr.next()
+        self.sell_mgr.next()
+        # self.sell_mgr.next()
