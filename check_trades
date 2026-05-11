@@ -1,0 +1,893 @@
+from datetime import datetime, timedelta, timezone
+import math
+import backtrader as bt
+import numpy as np
+import pandas as pd
+from learning3_data import CandleData2
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
+# ct is current_time and for backtesting it comes from minute_1 current_candle open_time ..
+# .. from file_filler
+
+NY = ZoneInfo("America/New_York")
+LDN = ZoneInfo("Europe/London")
+
+# current time in each zone
+now_ny = datetime.now(NY)
+now_ldn = datetime.now(LDN)
+
+# today at 08:30 in each zone
+ny_830 = datetime.combine(now_ny.date(), time(8, 30), tzinfo=NY)
+lon_830 = datetime.combine(now_ldn.date(), time(8, 30), tzinfo=LDN)
+
+# -----------------------------------------------------------------
+
+def get_order_by_ref(self, ref):
+    """Get the order by its reference."""
+    for o in self.broker.orders:
+        if o.ref == ref:
+            return o
+    return None
+
+def parse_datetime(dt_str):
+    if not dt_str:
+        return None
+    try:
+        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S%z").replace(tzinfo=None)
+    except ValueError:
+        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+
+
+def convert_to_datetime(ordinal_timestamp):
+    """
+    Converts an ordinal timestamp, ISO-formatted string, or datetime object into a datetime object.
+
+    Args:
+        ordinal_timestamp (int, str, datetime): The input timestamp.
+
+    Returns:
+        datetime: A datetime object, or None if the input is invalid.
+    """
+    try:
+        # Case 1: Input is already a datetime object
+        if isinstance(ordinal_timestamp, datetime):
+            return ordinal_timestamp
+        
+        # Case 2: Input is a string in ISO format
+        if isinstance(ordinal_timestamp, str):
+            return datetime.fromisoformat(ordinal_timestamp)  # Handles timezone-aware strings
+        
+        # Case 3: Input is an ordinal timestamp (integer or float)
+        if isinstance(ordinal_timestamp, float):
+            if not math.isfinite(ordinal_timestamp):
+                print(f"Warning: Invalid ordinal timestamp ({ordinal_timestamp}) ignored.")
+                return None
+            ordinal_timestamp = int(ordinal_timestamp)  # Truncate decimals
+        
+        if not isinstance(ordinal_timestamp, int):
+            raise ValueError("Ordinal timestamp must be an integer.")
+        
+        if ordinal_timestamp < 1 or ordinal_timestamp > 1_000_000:  # Arbitrary upper limit
+            raise ValueError("Ordinal timestamp is out of range.")
+        
+        base_date = datetime(1, 1, 1)  # Python ordinal base date
+        return base_date + timedelta(days=ordinal_timestamp - 1)  # Adjust for inclusive counting
+    
+    except (ValueError, OverflowError) as e:
+        print(f"Warning: Invalid ordinal timestamp: {ordinal_timestamp}. Error: {e}")
+        return None
+
+# numpy lowest:
+def lowest_price_order_np(c_p, price, open_time_str, cb, ct, m1_index):
+
+    data = CandleData2(c_p)
+    timeframeM1 = "M1"
+    candle_df = data.get_candles_bulk(timeframeM1, start=m1_index, end=0)  # returns pandas DataFrame
+
+    # Parse open_time string to naive datetime
+    open_time = datetime.strptime(open_time_str, "%Y-%m-%d %H:%M:%S%z").replace(tzinfo=None)
+    
+    if ct < open_time:
+        return False
+
+    # Filter candles where time >= open_time
+    valid_candles = candle_df[candle_df['Datetime'] >= open_time]
+    
+    if valid_candles.empty:
+        return False
+
+    return (valid_candles['Low'] >= price).all()
+
+def lowest_price_order_np_batch(c_p, prices, open_times, cb, ct, m1_index):
+    data = CandleData2(c_p)
+    timeframeM1 = "M1"
+    candle_df = data.get_candles_bulk(timeframeM1, start=m1_index, end=0)  # pandas DataFrame
+
+    # Convert open_time strings to naive datetimes
+    open_times_dt = np.array([parse_datetime(t) for t in open_times])
+
+    # Compare ct < open_times for all elements (vectorized)
+    ct_array = np.full(open_times_dt.shape, ct)
+    ct_mask = ct_array < open_times_dt
+    # If ct < open_time, return False for that element
+    results = np.full(len(prices), False, dtype=bool)
+    results[ct_mask] = False  # early False
+
+    # For each valid index, check candles after open_time
+    # Unfortunately, filtering candles per open_time is still tricky vectorized.
+    # Instead, for efficiency, you can iterate only over valid indexes:
+    valid_indexes = np.where(~ct_mask)[0]
+
+    # Step 1: Convert to datetime with timezone (UTC)
+    candle_df['Datetime'] = pd.to_datetime(candle_df['Datetime'], utc=True)
+
+    candle_df['Datetime'] = candle_df['Datetime'].dt.tz_convert('UTC')  # they were tz‑aware already
+
+    open_times_dt = pd.to_datetime(open_times, format="%Y-%m-%d %H:%M:%S", utc=True)
+
+    for i in valid_indexes:
+        open_time = open_times_dt[i]
+        price = prices[i]
+
+        valid_candles = candle_df[candle_df['Datetime'] >= open_time]
+        if valid_candles.empty:
+            results[i] = False
+        else:
+            results[i] = (valid_candles['Low'] >= price).all()
+
+    return results
+
+# numpy highest:
+def highest_price_order_np(c_p, price, open_time_str, cb, ct, m1_index):
+
+    data = CandleData2(c_p)
+    timeframeM1 = "M1"
+    candle_df = data.get_candles_bulk(timeframeM1, start=m1_index, end=0)  # returns pandas DataFrame
+
+    # Parse open_time string to naive datetime
+    open_time = datetime.strptime(open_time_str, "%Y-%m-%d %H:%M:%S%z").replace(tzinfo=None)
+    
+    if ct < open_time:
+        return False
+
+    # Filter candles where time >= open_time
+    valid_candles = candle_df[candle_df['Datetime'] >= open_time]
+    
+    if valid_candles.empty:
+        return False
+
+    return (valid_candles['High'] <= price).all()
+
+def highest_price_order_np_batch(c_p, prices, open_times, cb, ct, m1_index):
+
+    data = CandleData2(c_p)
+    timeframeM1 = "M1"
+    candle_df = data.get_candles_bulk(timeframeM1, start=m1_index, end=0)  # pandas DataFrame
+
+    # Convert open_time strings to naive datetimes
+    open_times_dt = np.array([parse_datetime(t) for t in open_times])
+    #open_times_dt = np.array([datetime.strptime(t, "%Y-%m-%d %H:%M:%S%z").replace(tzinfo=None) for t in open_times])
+
+    # Compare ct < open_times for all elements (vectorized)
+    ct_array = np.full(open_times_dt.shape, ct)
+    ct_mask = ct_array < open_times_dt
+    # If ct < open_time, return False for that element
+    results = np.full(len(prices), False, dtype=bool)
+    results[ct_mask] = False  # early False
+
+    # For each valid index, check candles after open_time
+    # Unfortunately, filtering candles per open_time is still tricky vectorized.
+    # Instead, for efficiency, you can iterate only over valid indexes:
+    valid_indexes = np.where(~ct_mask)[0]
+
+    # Step 1: Convert to datetime with timezone (UTC)
+    candle_df['Datetime'] = pd.to_datetime(candle_df['Datetime'], utc=True)
+
+    candle_df['Datetime'] = candle_df['Datetime'].dt.tz_convert('UTC')  # they were tz‑aware already
+
+    open_times_dt = pd.to_datetime(open_times, format="%Y-%m-%d %H:%M:%S", utc=True)
+
+    for i in valid_indexes:
+        open_time = open_times_dt[i]
+        price = prices[i]
+
+        valid_candles = candle_df[candle_df['Datetime'] >= open_time]
+        if valid_candles.empty:
+            results[i] = False
+        else:
+            results[i] = (valid_candles['High'] <= price).all()
+
+    return results
+
+
+
+# magic numbers :
+magic7771 = 7771    #4706;  # MAN
+magic7007 = 7007        #9778;   # SPEC
+magic7777 = 7777        #1025;   # regular buy1
+magic7778 = 7778        #6714;   # regular buy2
+magic7700 = 7700        #7780;  # regular buy1 negM1
+magic7701 = 7701        #7802;  # regular buy2 negM1
+magic7702 = 7702        #8080;  # negMAN (suprotni neg)
+magic7070 = 7070        #1082;  # R
+magic7001 = 7001        #1701;  # siva zona B
+magic7002 = 7002        #8070;  #/ nestedB
+
+magic4477 = 4477;  # WU
+   
+magic8881 = 8881    #1002;  # MAN
+magic8008 = 8008    #6702;  # SPEC
+magic8888 = 8888    #8888;  # regular sell1
+magic8889 = 8889    #4700;  # regular sell2
+magic8800 = 8800    #3801;  # regular sell1 negM1
+magic8801 = 8801    #1700;  # regular sell2 negM1
+magic8802 = 8802    #8072;  # negMAN (suprotni neg)
+magic8080 = 8080    #4078;  # R
+magic8001 = 8001    #9026;  # siva zona S
+magic8002 = 8002    #9083;  # nestedS
+
+isMagic7771 = magic7771 == 7771     #4706;  # MAN
+isMagic7007 = magic7007 == 7007        #9778;  # SPEC
+isMagic7777 = magic7777 == 7777        #1025;  # regular buy1
+isMagic7778 = magic7778 == 7778        #6714;  # regular buy2
+isMagic7700 = magic7700 == 7700        #3801;  # regular buy1 negM1
+isMagic7701 = magic7701 == 7701        #3802;  # regular buy2 negM1
+isMagic7702 = magic7702 == 7702        #8080;  # negMAN (suprotni neg)
+isMagic7070 = magic7070 == 7070        #1082;  # R
+isMagic7001 = magic7001 == 7001        #1701;  # siva zona B
+isMagic7002 = magic7002 == 7002        #8070;  #/ nestedB
+   
+isMagic4477 = 4477;  # WU
+   
+isMagic8881 = magic8881 == 8881     # MAN
+isMagic8008 = magic8008 == 8008     #6702;  # SPEC
+isMagic8888 = magic8888 == 8888     #8888;  # regular sell1
+isMagic8889 = magic8889 == 8889     #4700;  # regular sell2
+isMagic8800 = magic8800 == 8800     #3801;  # regular sell1 negM1
+isMagic8801 = magic8801 == 8801     #1700;  # regular sell2 negM1
+isMagic8802 = magic8802 == 8802     #8072;  # negMAN (suprotni neg)
+isMagic8080 = magic8080 == 8080     #4078;  # R
+isMagic8001 = magic8001 == 8001     #9026;  # siva zona S
+isMagic8002 = magic8002 == 8002     #9083;  # nestedS
+
+
+def isOMN_B(magic_number=None):
+
+    if magic_number == magic7777 or magic_number == magic7778 or magic_number == magic7771 or magic_number == magic7700 \
+       or magic_number == magic7701 or magic_number == magic7702 or magic_number == magic7007:
+        return True
+    
+    return False
+
+def isOMN_S(magic_number=None):
+
+    if magic_number == magic8888 or magic_number == magic8889 or magic_number == magic8881 or magic_number == magic8800 \
+       or magic_number == magic8801 or magic_number == magic8802 or magic_number == magic8008:
+        return True
+    
+    return False
+   
+# indexing :
+# class ot :
+class OrderTracker:
+    def __init__(self):
+
+        self.indexes = {
+            "M1": 0, "M15": 0, "M30": 0, "H1": 0, "H4": 0, "D1": 0
+        }
+
+    def currIndex(self, timeframe):
+        # Increase index based on timeframe logic
+        if timeframe == "M1":
+            self.indexes["M1"] += 1
+            
+            # Now update the other timeframes based on the current state of "M1"
+            if self.indexes["M1"] % 15 == 0:
+                self.indexes["M15"] += 1
+            if self.indexes["M1"] % 30 == 0:
+                self.indexes["M30"] += 1
+            if self.indexes["M1"] % 60 == 0:
+                self.indexes["H1"] += 1
+            #if self.indexes["M1"] % 240 == 0:
+            #   self.indexes["H4"] += 1
+            # ZATO STO TVOJI POCINJU OD 21 UMESTO OD 22H KOD H4 MORA OVAKO
+            if self.indexes["M1"] % 240 == 0:
+                self.indexes["H4"] += 1
+            if self.indexes["M1"] % 960 == 0:
+                self.indexes["D1"] += 1
+
+        return self.indexes[timeframe]
+
+class OrderTracker2:
+    __slots__ = ("m1","m15","m30","h1","h4","d1")
+
+    def __init__(self):
+        # all start at zero
+        self.m1 = self.m15 = self.m30 = self.h1 = self.h4 = self.d1 = 0
+
+    def tick(self):
+        """
+        Call this exactly once per M1bar. Returns the new M1 index.
+        Other TFs are updated internally.
+        """
+        m1 = self.m1 + 1
+        self.m1 = m1
+
+        # inline modulus checks
+        if m1 % 15   == 0: self.m15 += 1
+        if m1 % 30   == 0: self.m30 += 1
+        if m1 % 60   == 0: self.h1  += 1
+        # special H4 offset at 180 then every 240
+        if m1 >= 180 and (m1 - 180) % 240 == 0:
+            self.h4 += 1
+        if m1 % 960  == 0: self.d1  += 1
+
+        return m1
+
+
+#print("zadnji buy se desio ", {zadnjiBuy()})
+
+# python ea_test_final.py
+# python ea_test_final2.py
+# 4, 5, 9, 10, 11
+# may25, nov25 : 11, 12, 16, 17, 18
+# trading hours:
+asia_2 = 4
+asia_3 = 5
+
+london_8 = 9 
+london_9 = 10 
+london_10 = 11 
+
+ny_14 = 21 
+ny_15 = 22
+ny_16 = 23 
+ny_17 = 00
+
+last_hour = 16
+
+
+def checkTime(ct):
+    global london_8, london_9, london_10, ny_14, ny_15, ny_16, last_hour # asia_2, asia_3, 
+    if isinstance(ct, np.datetime64):
+        ct = ct.item()
+        
+    hour = ct.hour
+    minute = ct.minute
+    
+    # PROMENI DA BUDE 0 SA 30 ASIA START
+
+    range1 = (hour == asia_2 and 00 <= minute <= 59) or (hour == asia_3 and 00 <= minute <= 59)
+    range2 = (hour == london_8 and 00 <= minute and minute <= 59) or (hour == london_9 and 00 <= minute and minute <= 59) or \
+                (hour == london_10 and 00 <= minute and minute <= 59)
+    range3 = (hour == ny_14 and 00 <= minute and minute <= 59) or (hour == ny_15 and 00 <= minute and minute <= 59) or \
+                (hour == ny_16 and 00 <= minute and minute <= 59) or (hour == ny_17 and 00 <= minute and minute <= 59)
+    
+    last_hour = (hour == last_hour and 00 <= minute <= 59)
+    
+    forbiden = hour == 15 or hour == 16
+    
+    
+    if range2 or range1:
+        return 12  # L
+    elif range3:
+        return 13  # NY
+    elif forbiden:
+        return 1312
+    elif last_hour:
+        return 2359
+    else:
+        return None
+
+def last_range(ct):
+    
+    global london_8, london_9, london_10, ny_14, ny_15, ny_16 # asia_2, asia_3, 
+    if isinstance(ct, np.datetime64):
+        ct = ct.item()
+        
+    hour = ct.hour
+    minute = ct.minute
+    
+
+    rangeSpec_isTimeTrue2 = (hour == ny_14 and 00 <= minute and minute <= 59) or \
+                            (hour == ny_15 and 00 <= minute and minute <= 59) or \
+                            (hour == ny_16 and 00 <= minute and minute <= 38)
+    
+    #rangeLast1 = (hour == asia_3 and minute >= 00 and minute <= 38)
+    rangeLast2 = (hour == london_10 and minute >= 00 and minute <= 38)
+    rangeLast3 = (hour == ny_16 and minute >= 00 and minute <= 38)
+    
+    #print(f"ct hour = {hour}, ct minute = {minute}")
+
+    #if rangeSpec_isTimeTrue2:
+    #    return 111
+    if rangeLast2 or rangeLast3:
+        return 999
+    else:
+        return None
+
+# TAKE NOTE THAT CHECKSTARTTIME_DT DAJE DATETIME REZULTAT JER IMA _DT !!!
+
+def checkST_dt(ct):
+    # normalize to datetime
+    if isinstance(ct, np.datetime64):
+        ct = ct.astype('datetime64[s]').astype(datetime)
+
+    r = checkTime(ct)
+    #if r == 11:
+    #    return ct.replace(hour=asia_2, minute=0, second=0, microsecond=0)
+    if r == 12:
+        return ct.replace(hour=london_8, minute=0, second=0, microsecond=0)
+    if r == 13:
+        return ct.replace(hour=ny_14, minute=30, second=0, microsecond=0)
+
+    return ct  # <- don’t return None
+
+
+class checkOrders:
+
+
+    def __init__(self, csv_paths):
+        
+
+        pass
+
+
+    # checkOOB/S :
+    def checkOOB_S_np(self, otr, st):
+        """
+        Count how many buy‐trades in trade_log never dipped below their stop_loss
+        on M1 between open_time and now (m1_idx).
+
+        Only considers trades with open_time >= st.
+        """
+        # make sure st is datetime64 for comparison
+        st = np.datetime64(st)
+
+        # keep only trades opened after st
+        if otr:
+            otr_after_st = [
+                t for t in otr
+                if np.datetime64(t['open_time']) >= st
+            ]
+        else:
+            otr_after_st = []
+
+        if not otr_after_st:
+            buy_open_count = sell_open_count = total_open = 0
+            print(f"No open trades after {st}.")
+            return 0, 0
+
+        buy_open_count  = sum(t['action'] == 'buy'  for t in otr_after_st)
+        sell_open_count = sum(t['action'] == 'sell' for t in otr_after_st)
+        total_open      = len(otr_after_st)
+
+        print(
+            f"OPEN TRADES AFTER {st} -> "
+            f"total={total_open}, buys={buy_open_count}, sells={sell_open_count}"
+        )
+                
+        return buy_open_count, sell_open_count
+
+    # currBuySellOpen_dt_cena :
+    def currBuySellOpen_dt_cena(self, open_orders, ct, st, m1_idx):
+        """
+        Returns:
+          (buy_time, buy_price), (sell_time, sell_price)
+        for the **latest** BUY and SELL that:
+          - open_time ≥ st
+          - open_time ≤ ct
+          - never dipped below/above SL on M1
+          - magic passes isOMN_B / isOMN_S
+        """
+        buy_res  = (None, None)
+        sell_res = (None, None)
+
+        if not open_orders:
+            return buy_res, sell_res
+
+        # parse once
+        st_dt = (
+            datetime.strptime(st, "%Y-%m-%d %H:%M:%S%z")
+            .replace(tzinfo=None) if isinstance(st, str) else st
+        )
+        ct_dt = (
+            datetime.strptime(ct, "%Y-%m-%d %H:%M:%S%z")
+            .replace(tzinfo=None) if isinstance(ct, str) else ct
+        )
+
+        for trade in reversed(open_orders):
+            ot = trade['open_time']
+            open_dt = (
+                datetime.strptime(ot, "%Y-%m-%d %H:%M:%S%z")
+                .replace(tzinfo=None) if isinstance(ot, str) else ot
+            )
+            if not (st_dt <= open_dt <= ct_dt):
+                continue
+
+            magic = trade['magic_number']
+
+            if trade['action'] == 'buy' and buy_res[0] is None:
+                # must be in‐bounds and isOMN_B
+                if isOMN_B(magic):
+                    buy_res = (open_dt, trade['open_price'])
+
+            elif trade['action'] == 'sell' and sell_res[0] is None:
+                if isOMN_S(magic):
+                    sell_res = (open_dt, trade['open_price'])
+
+            # once we have both, we can stop
+            if (buy_res[0] is not None) or (sell_res[0] is not None):
+                break
+
+        return buy_res, sell_res
+    
+    def negativeTradesAll_B_S_np(self, trade_log, ct, st, m1_idx):
+        ntB = ntS = ntAll = 0
+        if not trade_log:
+            return 0, 0, 0
+
+        def parse_time(x):
+            if isinstance(x, str):
+                try:
+                    return datetime.strptime(x, "%Y-%m-%d %H:%M:%S%z").replace(tzinfo=None)
+                except ValueError:
+                    return datetime.strptime(x, "%Y-%m-%d %H:%M:%S")
+            return x
+
+        st_dt = parse_time(st)
+        ct_dt = parse_time(ct)
+
+        for trade in reversed(trade_log):
+            profit = trade.get('profit')
+            if profit is None:
+                continue
+
+            open_dt = parse_time(trade['open_time'])
+            if not (st_dt <= open_dt <= ct_dt):
+                continue
+
+            magic = trade['magic_number']
+            if not (isOMN_B(magic) or isOMN_S(magic)):
+                continue
+
+            rr = trade.get("risk_reward", 0)
+
+            # Skip if risk/reward is not negative
+            if rr >= 0:
+                continue
+
+            # Determine multiplier
+            if magic == 7007:
+                mult = 5
+            elif magic == 8008:
+                mult = 5
+            else:
+                mult = 1
+
+            # Count
+            if trade['action'] == 'buy':
+                ntB += mult
+            elif trade['action'] == 'sell':
+                ntS += mult
+
+            ntAll += mult
+
+        return ntAll, ntB, ntS
+
+
+    def _to_dt(x):
+        if x is None:
+            return None
+        if isinstance(x, datetime):
+            return x
+        # expects "YYYY-mm-dd HH:MM:SS+ZZZZ"
+        return datetime.strptime(x, "%Y-%m-%d %H:%M:%S%z").replace(tzinfo=None)
+    
+    # max_miotb_s :
+    def maxMIOT_B(self, open_trades, closed_trade, ct, st, m1_index):
+
+        (openOfCurrB, _), (_, _) = checkOrders.currBuySellOpen_dt_cena(self, open_trades, ct, st, m1_index)
+        st_dt = checkOrders._to_dt(st)
+        if not closed_trade or openOfCurrB is None or (st_dt and openOfCurrB < st_dt):
+            return 0
+
+        return sum(
+            1
+            for tr in reversed(closed_trade)
+            if tr['action']=='buy'
+            and tr['open_time'] >= openOfCurrB
+            and (tr['break_even'] == False or tr['break_even'] == 'False')
+        )
+
+    def maxMIOT_S(self, open_trades, closed_trade, ct, st, m1_index):
+
+        (_, _), (openOfCurrS, _) = checkOrders.currBuySellOpen_dt_cena(self, open_trades, ct, st, m1_index)
+        st_dt = checkOrders._to_dt(st)
+        if not closed_trade or openOfCurrS is None or (st_dt and openOfCurrS < st_dt):
+            return 0
+
+        return sum(
+            1
+            for tr in reversed(closed_trade)
+            if tr['action']=='sell'
+            and tr['open_time'] >= openOfCurrS
+            and (tr['break_even'] == False or tr['break_even'] == 'False')
+        )
+
+
+    # negative trades all B/S :
+    
+
+
+def zadnjiB_S_dt_cena(trade_log, st):
+    """
+    Returns:
+      (buy_dt, buy_price), (sell_dt, sell_price)
+    for the latest BUY and SELL with:
+      - open_time ≥ st
+      - magic not in their respective exclusion sets
+    Stops as soon as it has both.
+    """
+    buy_exclude  = {magic4477, magic7002, magic7070} #??? , magic7771}
+    sell_exclude = {magic4477, magic8002, magic8080} #??? , magic8881}
+
+    buy_res  = (None, None)
+    sell_res = (None, None)
+    st_dt = st if not isinstance(st, str) else datetime.strptime(st, "%Y-%m-%d %H:%M:%S%z").replace(tzinfo=None)
+
+    for trade in reversed(trade_log):
+        ot = trade['open_time']
+        open_dt = (ot if not isinstance(ot, str)
+                   else datetime.strptime(ot, "%Y-%m-%d %H:%M:%S%z").replace(tzinfo=None))
+
+        if open_dt < st_dt:
+            continue
+
+        mag = trade['magic_number']
+        price = trade['open_price']
+
+        if trade['action'] == 'buy' and buy_res[0] is None:
+            if mag not in buy_exclude:
+                buy_res = (open_dt, price)
+
+        elif trade['action'] == 'sell' and sell_res[0] is None:
+            if mag not in sell_exclude:
+                sell_res = (open_dt, price)
+
+        # once both found, break
+        if buy_res[0] and sell_res[0]:
+            break
+
+    return buy_res, sell_res
+
+
+# checkMAN_buy/sell :
+def checkMAN_B_S(open_trades, st):
+
+    openB, openS = 0, 0
+
+    if not open_trades:
+        return 0, 0
+    
+    for trade in open_trades:
+        opentime, magic = trade['open_time'], trade['magic_number']
+
+        if trade['action'] == 'buy':
+            if opentime >= st and magic == magic7771:
+
+                openB+=1
+
+        if trade['action'] == 'sell':
+            if opentime >= st and magic == magic8881:
+
+                openS+=1
+
+    return openB, openS
+
+
+
+# !  !   !   !   !   !   !   !   !      OVDE DODAJ BUYLIMIT    !   !   !   !   !   !   !   !   !
+# !  !   !   !   !   !   !   !   !      OVDE DODAJ BUYLIMIT    !   !   !   !   !   !   !   !   !
+# !  !   !   !   !   !   !   !   !      OVDE DODAJ BUYLIMIT    !   !   !   !   !   !   !   !   !
+
+# nije testirana ova f-ja:
+def isOrderOpenB(openprice, trade_log):
+
+    if not trade_log:
+        return False
+
+    for trade in reversed(trade_log):
+
+        openpriceee = trade['open_price']
+        openpriceee_rounded = round(openpriceee, 2)
+        openprice_rounded = round(openprice, 2)
+        
+        if trade['action'] == 'buy' or trade['action'] == 'buy_limit':
+
+            if openpriceee_rounded == openprice_rounded:
+
+                return True
+
+    return False
+
+# nije testirana ova f-ja:
+def isOrderOpenS(openprice, trade_log):
+
+    if not trade_log:
+        return False
+
+    for trade in reversed(trade_log):
+
+        openpriceee = trade['open_price']
+        openpriceee_rounded = round(openpriceee, 2)
+        openprice_rounded = round(openprice, 2)
+        
+        if trade['action'] == 'sell' or trade['action'] == 'sell_limit':
+
+            if openpriceee_rounded == openprice_rounded:
+
+                return True
+
+    return False
+
+def checkOpenPendingOpenedOrder(magic_number_of_trade, trade_log, ct, st):
+
+    opentrades = 0
+
+    if not trade_log:
+        return 0
+
+    for trade in reversed(trade_log):
+
+        opentime, magic = trade['open_time'], trade['magic_number']
+
+        if opentime >= st and opentime >= checkST_dt(ct) and magic == magic_number_of_trade:
+
+            opentrades+=1
+
+    return opentrades
+
+def checkOpenOrder70078008(ct, st, trade_log):
+
+    opentrades = 0
+
+    if not trade_log:
+        return 0
+
+    for trade in reversed(trade_log):
+
+        opentime, magic = trade['open_time'], trade['magic_number']
+
+        if opentime >= st and opentime >= checkST_dt(ct) and magic is {magic7007 or magic8008}:
+
+            opentrades+=1
+
+    return opentrades
+
+#   -   -   -   -   -   -   -   N   E   G   A   T   I   V   E   -   -   -   -   -   -   -
+
+
+
+# nije testirana ova f-ja:
+def isThreeNegativeMAN(closed_trades, cb, ct, st, m1_index):
+
+    negtradesb, negtradess = 0, 0
+
+    if not closed_trades:
+        return False
+
+    for trade in closed_trades:
+
+        opentime, magic, stoploss = trade['open_time'], trade['magic_number'], trade['stop_loss']
+        profit = trade['profit']
+        cst = checkST_dt(ct) 
+
+        if all(x is not None for x in [profit, opentime, magic]):
+
+            if opentime >= st and opentime >= cst and profit < 0 : #and volume == LotSize:
+            
+                if trade['action'] == 'buy':
+                
+                    if magic == magic7771:          # closed
+                        negtradesb+=1
+
+                if trade['action'] == 'sell':     
+
+                    if magic == magic8881:          # closed
+                        negtradess+=1
+
+    if negtradesb >= 2 or negtradess >= 2:
+
+        return True
+
+    return False
+
+def checkOpenFakeNEG(trade_log, cb, ct, st, m1_index):
+
+    if not trade_log:
+        return True
+
+    for trade in reversed(trade_log):
+
+        opentime, magic = trade['open_time'], trade['magic_number']
+        cst = checkST_dt(ct)
+
+        if opentime >= st and opentime >= cst and magic in {magic7702 or magic8802}:
+
+            return False
+
+    return True
+
+
+
+# provera volatilnosti:
+
+def checkVolatility():
+
+    truee = False
+
+    # Ovo se koristi da se promeni: SL, BE velicina
+
+    return truee
+
+
+# provera conBE :
+
+def conBE(otr, st):
+    res_b = False
+    res_s = False
+
+    dtype = [
+        ('action', 'U4'),
+        ('magic_number', 'i8'),
+        ('open_time', 'datetime64[s]'),
+    ]
+
+    data = np.array([
+        (
+            trade['action'],
+            trade['magic_number'],
+            np.datetime64(trade['open_time'])  # works if it's str or datetime
+        )
+        for trade in otr
+    ], dtype=dtype)
+
+    st_np = np.datetime64(st)
+
+    # --- BUY SIDE ---
+    buy_mask = data['action'] == "buy"
+    buy_data = data[buy_mask]
+    buy_pos_in_data = np.nonzero(buy_mask)[0]
+
+    if buy_data.size > 0:
+        order_desc = np.argsort(buy_data['open_time'])[::-1]
+        buy_indices = buy_pos_in_data[order_desc]
+        first_two_indices = buy_indices[:2]
+
+        magicLast           = data['magic_number'][first_two_indices[0]]
+        last_buy_open_time  = data['open_time'][first_two_indices[0]]
+
+        # FIXED: use == / in, not "is" and bare magic number
+        if magicLast in (magic7778, magic7701, magic7771) and last_buy_open_time >= st_np:
+            res_b = True
+
+    # --- SELL SIDE ---
+    sell_mask = data['action'] == "sell"
+    sell_data = data[sell_mask]
+    sell_pos_in_data = np.nonzero(sell_mask)[0]
+
+    if sell_data.size > 0:
+        order_desc = np.argsort(sell_data['open_time'])[::-1]
+        sell_indices = sell_pos_in_data[order_desc]
+        first_two_indices_s = sell_indices[:2]
+
+        magicLast           = data['magic_number'][first_two_indices_s[0]]
+        last_sell_open_time = data['open_time'][first_two_indices_s[0]]
+
+        # FIXED: same here
+        if magicLast in (magic8889, magic8801, magic8881) and last_sell_open_time >= st_np:
+            res_s = True
+
+    return res_b, res_s
