@@ -1,0 +1,668 @@
+class buyStrategy:
+
+    def __init__(self, data, shared, parent): #, offsets, percents, risk_reward):
+        self.order_tracker = OrderTracker()  # Create instance of OrderTracker
+        #self.order_tracker = order_tracker #create_order_tracker
+        
+        self.order_magic_map = {} 
+
+        self.data   = data
+        self.parent = parent
+        self.shared = shared # sharedState()
+        #self.offsets, self.percents, self.risk_reward = offsets, percents, risk_reward
+        
+        self.csv_paths = {
+            'M1':  learning10_new.CSV_PATHS['M1'],
+            'M15': learning10_new.CSV_PATHS['M15'],
+            'M30': learning10_new.CSV_PATHS['M30'],
+            'H1':  learning10_new.CSV_PATHS['H1'],
+            'H4':  learning10_new.CSV_PATHS['H4'],
+            'D1':  learning10_new.CSV_PATHS['D1'],
+        }
+
+        
+        self.shared.csv_paths = self.csv_paths
+        self.scanner_liq    = LiquidityScanner(self.csv_paths)
+        self.scanner_liq15  = LiquidityScanner_M15(self.csv_paths)
+        self.scanner_neg    = NegationScanner(self.csv_paths)
+        self.scanner_hcs    = HCS_Scanner(self.csv_paths)
+        self.check_orders   = checkOrders(self.csv_paths)
+        #self.minute1       = MinutePermission2(self.csv_paths)
+
+    def trade_rr_from_levels(self, trade, params_buy=None):
+        rr = trade.get("risk_reward", 0.0)
+        return float(rr or 0.0)
+
+
+    # --- OPEN BUY ORDER ---
+    def buy_order(self, ct, cb, volume, con13, magic):
+
+        specCon = magic == checkTrades.magic7007
+        manMagic = magic == checkTrades.magic7771
+        stop_loss, scenario = None, 25
+
+        stop_loss = self.shared.params_buy["stop_loss_25"]
+        
+        open_px = float(cb)
+        sl_px = open_px - stop_loss
+        tp_px = open_px + self.shared.params_buy["take_profit"] 
+        # python EA_test_final2.py
+        order = self.parent.buy(size=volume, exectype=bt.Order.Market)
+
+        trade_info = dict(
+            scenario=float(scenario),
+            action="buy",
+            lot_size=float(volume),
+            open_price=open_px,
+            close_price=float(0.0),
+            open_time=ct,
+            close_time=datetime.min,
+            stop_loss=sl_px,
+            take_profit=tp_px,
+            closed_size=0.0,
+            break_even=False,
+            current_rr=0.0,
+            levels_hit=set(),
+            max_price=0.0,
+            min_price=0.0,
+            magic_number=magic,
+            risk_reward=0.0,
+            profit=0.0
+        )
+
+        self.shared.trade_log.append(trade_info)
+        self.shared.open_trades.append(trade_info)
+
+        print(f"[BUY OPEN] {ct} | price={open_px:.2f} | SL={sl_px:.2f} | volume={volume} | magic={magic}")
+        return order
+
+    def next(self):
+
+        time.sleep(0.2)
+
+        timeframeM1, timeframeM15, timeframeM30 = "M1", "M15", "M30"
+        timeframeH1, timeframeH4, timeframeD1   = "H1", "H4", "D1"
+
+        tl  = self.shared.trade_log
+        ot  = self.order_tracker
+        otr = self.shared.open_trades
+        ctr = self.shared.closed_trades
+
+        # stari order_Tracker
+        m1_index = ot.currIndex(timeframeM1)
+
+        prev_ci15 = max(0, ot.currIndex(timeframeM15))
+        prev_ci30 = max(0, ot.currIndex(timeframeM30))
+
+        ciM15 = prev_ci15-1       #current index m15 timeframe
+        ciM30 = prev_ci30-1       #current index m15 timeframe
+        ciH1  = max(0,ot.currIndex(timeframeH1)-1)       #current index h1 timeframe
+        ciH4  = max(0,ot.currIndex(timeframeH4)-1)       #current index h4 timeframe
+        ciD1  = ot.currIndex(timeframeD1)-1              #current index d1 timeframe
+
+        self.shared.prev_ci15, self.shared.prev_ci30 = prev_ci15, prev_ci30
+
+        # ct : naive datetime of current M1 candle
+        current_timeee = self.data.datetime.datetime(0)
+
+        # 3) Now you have correct indexes per TF
+        self.shared.m1_index = m1_index
+
+        data = CandleData2(self.csv_paths)
+
+        ct_datetime = data.get_ct(timeframeM1, m1_index)   # already tz-naive
+        ct = ct_datetime
+
+        isTime         = isTimeTrue(ct)
+        news15         = timeFilter.newsRange_15(ct)
+
+        st = ct - (timedelta(hours=0.5) if isTime else timedelta(hours=3))
+
+        # full candle dict (for prices etc.)
+        candles_current_time = data.get_candle(timeframeM1, m1_index)
+
+        # cb : open price of current M1 candle
+        cb = candles_current_time['Open']
+        cl = candles_current_time['Low']
+        ch = candles_current_time['High']
+
+        self.shared.ct = ct
+        self.shared.st = st
+        self.shared.cb = cb
+        self.shared.ch = ch
+
+        isNewM1  = None #quote_app.is_new_candle(60,    consume=True)
+        isNewM15 = None #quote_app.is_new_candle(900,   consume=True)
+        isNewM30 = None #quote_app.is_new_candle(1800,  consume=True)
+        isNewH1  = None #quote_app.is_new_candle(3600,  consume=True)
+        isNewH4  = None #quote_app.is_new_candle(14400, consume=True)
+        isNewD1  = None #quote_app.is_new_candle(86400, consume=True)
+
+        # 2) M1 logic – runs ONLY when a new M1 candle has just closed
+
+        m1_last = m1_index -1 
+
+        cST_dt = checkTrades.checkST_dt(ct)
+        # Only parse if it's a str:
+        if isinstance(cST_dt, str):
+            cST_dt = datetime.strptime(cST_dt, "%Y-%m-%d %H:%M:%S%z")
+        # If you need numpy form:
+        cST_dt = np.datetime64(cST_dt)
+
+
+        isNewsRange = timeFilter.newsRange(ct)
+
+        start_time_bcon = time.perf_counter()
+
+        negTrades, negT_B, negT_S  = self.check_orders.negativeTradesAll_B_S_np(tl, ct, st, m1_index)
+        cc = checkTrades.checkTime(ct)
+        con13 = (cc == 12 or cc == 13)
+        self.shared.con13 = con13
+        conBE_B, conBE_S = checkTrades.conBE(otr, st)
+
+        #   -   -   -   -   PARTIALS   -   -   -   -   :
+        if otr is not None:
+            self.shared.check_partial_closes(ct, cb, conBE_B, conBE_S)
+
+        holiday                 = timeFilter.isHoliday(ct)
+        self.shared.holiday     = holiday
+
+        if holiday:
+            print(" --- HOLIDAY TIME - NO TRADING --- ")
+            return
+
+        combined_rr = 0.0
+        # calculating current risk unit result from closed trades array
+        for t in ctr: 
+            combined_rr += self.trade_rr_from_levels(t, self.shared.params_buy)
+
+        # calculating current risk unit result from open trades array
+        for t in otr:
+            combined_rr += self.trade_rr_from_levels(t, self.shared.params_buy)
+
+        print(f"\n RESULT CURRENTLY : RR for this strategy batch:", combined_rr)
+
+        #volume = self.params_buy['lot_size']
+        checkOOB, checkOOS = self.check_orders.checkOOB_S_np(otr, st)
+
+        self.shared.checkOOB, self.shared.checkOOS = checkOOB, checkOOS
+
+        # python EA_test_final2.py
+
+        """Called on each new candle from csv file"""
+        print(f"\n ---  New Candle --- Ct: {ct} --- m1_idx : {m1_index} --- cb : {cb} \n \
+            st : {st} --- checkoob : {checkOOB} --- checkoos : {checkOOS} \n \
+                cST_dt : {cST_dt}")
+
+        self.shared.ciD1 = ciD1
+        self.shared.ciH1 = ciH1
+        #idx_h4 = ot.currIndex(timeframeH4)-1
+
+        
+        #   -   -   -   -   -   -   -   -   L   -   I   -   Q   -   -   -   -   -   -   -   -   -
+        #   -   -   -   -   -   -   -   -   L   -   I   -   Q   -   -   -   -   -   -   -   -   -
+        #   -   -   -   -   -   -   -   -   L   -   I   -   Q   -   -   -   -   -   -   -   -   -
+        # LOGIKA DA IMPLEMENTIRAS U BUY-U I SELL-U :
+
+        if isNewH1:
+            self.liq.on_new_tf_candle(self, timeframeH1)
+
+        if isNewH4:
+            self.liq.on_new_tf_candle(self, timeframeH4)
+
+        start_time_bcon2 = time.perf_counter()
+
+        (liq_buy, priceB1, priceB2, liq_sell, priceS1, priceS2, z1, z2, z1s, z2s) = \
+            self.scanner_liq.find_liq(m1_last, ct, cb, ciH1, ciH4) 
+        #None, None, None, None, None, None
+        
+        self.shared.liqBuy  = liq_buy
+        self.shared.B1      = priceB1
+        self.shared.B2      = priceB2
+        self.shared.liqSell = liq_sell
+        self.shared.S1      = priceS1
+        self.shared.S2      = priceS2
+
+        #time.sleep(0.2)
+        
+        (liq_buy_d, priceB1_d, priceB2_d, liq_sell_d, priceS1_d, priceS2_d, z1_d, z2_d, z1s_d, z2s_d) = \
+        self.scanner_liq.find_liq_D(ct, m1_last, cb, ciD1)
+        
+        self.shared.liqBuy_D    = liq_buy_d
+        self.shared.B1_D        = priceB1_d
+        self.shared.B2_D        = priceB2_d
+        self.shared.liqSell_D   = liq_sell_d
+        self.shared.S1_D        = priceS1_d
+        self.shared.S2_D        = priceS2_d
+
+        
+        # CSV_PATSH :
+        c_p                     = self.shared.csv_paths 
+
+        # ZADNJI DT :
+        (zB_dt, zB_cena), (zS_dt, zS_cena) = checkTrades.zadnjiB_S_dt_cena(tl, st)
+
+        # negation :
+        ear_type, ear_dt        = None, None
+            #self.scanner_neg.find_neg_mid(c_p, checkOOB, checkOOS, cST_dt, st, m1_index, ct, zB_dt, zS_dt, ciM15, ciM30)
+        negBig_type, negBig_dt  = None, None
+            #self.scanner_neg.find_neg_big(cST_dt, st, m1_index, zB_dt, zS_dt, ct, ciH1, ciH4)
+        
+        buyBig_dt, sellBig_dt   = None, None
+        if negBig_type == "BUY":
+            buyBig_dt = negBig_dt
+        elif negBig_type == "SELL":
+            sellBig_dt = negBig_dt
+
+        self.shared.ear_type, self.shared.ear_dt         = ear_type, ear_dt
+        self.shared.negBig_type, self.shared.negBig_dt   = negBig_type, negBig_dt
+        self.shared.buyBig_dt, self.shared.sellBig_dt    = buyBig_dt, sellBig_dt
+
+        # HCS :
+        vremeZ_dt_B = self.scanner_hcs.find_hcs_mid_B(c_p, checkOOB, zB_dt, cST_dt, st, ct, ciM15, ciM30)
+        vremeZ_dt_S = self.scanner_hcs.find_hcs_mid_S(c_p, checkOOS, zS_dt, cST_dt, st, ct, ciM15, ciM30)
+
+        hcsBig_dt   = self.scanner_hcs.find_hcs_big(cST_dt, st, ct)
+
+        self.shared.vremeZ_dt_B, self.shared.vremeZ_dt_S    = vremeZ_dt_B, vremeZ_dt_S
+        self.shared.hcsBig_dt  = hcsBig_dt
+
+        liq15_B, liq15_S = \
+            self.scanner_liq15.find_liqM15_B_S(
+                    m1_idx = m1_last,
+                    ct     = ct,
+                    cb     = cb,
+                    st     = st,
+                    ciM15  = ciM15,
+                    ciM30  = ciM30,
+                    z1     = z1,
+                    z1_d   = z1_d,
+                    z1s    = z1s,
+                    z1s_d  = z1s_d,
+                    zB_dt  = zB_dt,
+                    zS_dt  = zS_dt,
+                    debug  = False
+                )
+
+        self.shared.liq15_B, self.shared.liq15_S            = liq15_B, liq15_S
+
+        end_time_bcon2 = time.perf_counter()
+        print(f"Execution time to call liq functions: {end_time_bcon2 - start_time_bcon2:.6f} seconds")
+
+        print(f"ci15 : {ciM15}, ci30 : {ciM30}, ciH1 : {ciH1}, ciH4: {ciH4} \n \
+              m1_last : {m1_last}, m1Index : {m1_index} ")
+
+        # python EA_test_final2.py
+        if liq15_B:
+            print(f"\n I T ' S : liq15_B !")
+            #time.sleep(0.2)
+        if liq15_S:
+            print(f"\n I T ' S : liq15_S ! ")
+            #time.sleep(0.2)
+
+        
+        print(f" Neg MID     = {ear_dt}, type = {ear_type}")
+        print(f" Neg BIG_buy = {buyBig_dt},   \n Neg BIG_sell  = {sellBig_dt}")
+        print(f" Hcs_B MID   = {vremeZ_dt_B}, type = {type(vremeZ_dt_B)} \n \
+              Hcs_S MID = {vremeZ_dt_S}, \n HCS BIG = {hcsBig_dt}")
+        
+        #time.sleep(0.1)
+        
+        # python EA_test_final2.py
+
+        start_time_bcon = time.perf_counter()
+
+        print("\n🔓 OPEN TRADES :")
+        for i, trade in enumerate(otr, 0):
+            print(f"{i}. {trade}")
+            #time.sleep(0.2)
+            #pass
+
+        # python ea_test_final2.py
+
+
+        print(f" OVO GLEDAJ : number of negative trades = {negTrades} ")
+
+        
+        self.shared.negTrades   = negTrades
+        self.shared.negT_B      = negT_B
+        self.shared.negT_S      = negT_S
+        self.shared.isTime      = isTime
+        self.shared.news15      = news15
+
+        mmb                     = 0 #self.check_orders.maxMIOT_B(otr, ctr, ct, st, m1_index) # market open boolean 
+        mms                     = 0 #self.check_orders.maxMIOT_S(otr, ctr, ct, st, m1_index) # market open boolean 
+        (cOB_dt, cOB_price), (cOS_dt, cOS_price)      = self.check_orders.currBuySellOpen_dt_cena(otr, ct, st, m1_index)
+        allowVol_B_M1           = True #numpy_permission.allowVolatility_B_M1(m1_index, checkOOB, negT_B)
+        allowVol_B              = numpy_permission.allowVolatilityB(self.csv_paths, m1_last) 
+        zPendB                  = None
+        allowTradeB1            = checkOOB <= 0
+        is3man                  = checkTrades.isThreeNegativeMAN(ctr, cb, ct, st, m1_index)
+        checkOF_NEG             = checkTrades.checkOpenFakeNEG(tl, cb, ct, st, m1_index)
+        
+        self.shared.mms         = mms
+        self.shared.checkOF_NEG = checkOF_NEG
+        self.shared.is3man      = is3man
+        self.shared.negT_S      = negT_S
+
+        self.shared.zS_dt, self.shared.zS_cena      = zS_dt, zS_cena
+        self.shared.cOS_dt, self.shared.cOS_price   = cOS_dt, cOS_price
+
+        print(f" \n currOB_dt : {cOB_dt}, currOB_price : {cOB_price} \n \
+              mmb : {mmb},  checkOOB : {checkOOB}, checkOOS : {checkOOS} \n \
+              allowTradeB1 : {allowTradeB1}, \n \
+              allowVol_B_M1 : {allowVol_B_M1}, allowVol_B : {allowVol_B} \n \
+                zB_Dt : {zB_dt}, zS_dt : {zS_dt}")
+
+        volume = self.shared.params_buy['lot_size']
+
+        # ova spremenljivka je za m1 candle-ove !!!
+
+        # Pozivanje variabli :
+        liqBuy = self.shared.liqBuy
+        B1 = self.shared.B1 
+        B2 = self.shared.B2 
+        liqSell = self.shared.liqSell
+        S1 = self.shared.S1
+        S2 = self.shared.S2
+
+        liqBuy_D = self.shared.liqBuy_D
+        B1_D = self.shared.B1_D
+        B2_D = self.shared.B2_D
+        liqSell_D = self.shared.liqSell_D
+        S1_D = self.shared.S1_D
+        S2_D = self.shared.S2_D    
+
+        forbid_ree = timeFilter.reentery_forbidden_range(ct)
+        self.shared.forbid_ree = forbid_ree
+
+        self.shared.buy7778, self.shared.buy7777 = None, None
+        
+        end_time_bcon = time.perf_counter()
+
+        print(f"\n BS Execution time for BUY STRATEGY: {end_time_bcon-start_time_bcon:.6f} seconds")
+
+        # python ea_test_final2.py
+        if not holiday:
+            
+
+            if isTime: # MAN_BUY, buy7777, 7778, 7700, 7701, 7702, 7070(R) :
+
+                print(f"BS: istime true is true, cb: {cb}, ct : {ct}, islastrange : {timeFilter.isLastRange(ct)}")
+
+
+            if allowVol_B_M1 and allowVol_B:
+                    
+                    if allowTradeB1:
+
+                        specB = None #SPEC.specialCommand_B(self.csv_paths, priceB1, priceB1_d, cb, cl, ct, ciH1, ciD1)
+                        bcon  = numpy_permission.buyCondition(c_p, cb, prev_ci15, prev_ci30, liqBuy, liqBuy_D, vremeZ_dt_B, \
+                                        ear_dt, ear_type, hcsBig_dt, buyBig_dt, zB_dt, zPendB, st)
+                
+                        print(f"bcon : {bcon})")
+
+                        bcon2 = numpy_permission.is_buy_condition_2(checkOOB, checkOOS, specB, liq15_B, bcon)
+
+                        print(f"bcon2 : {bcon2})")
+
+                        #buy7070 = numpy_permission.buy7070(tl, checkOOB, checkOOS,  st) 
+                        buy7777 = numpy_permission.buy7777(False, True, bcon, bcon2)
+                        self.shared.buy7777 = buy7777
+                        buy7700 = numpy_permission.buy7700(True, bcon, bcon2)
+
+                        if buy7700:
+                            print(f"buy7700 is true, ct : {ct}, cb : {cb}")
+                            self.buy_order(ct, cb, volume, con13, magic=checkTrades.magic7700)
+                            # SIVA ZONA _ BUY
+                            print("\n CLOSED TRADES :")
+                            for i, trade in enumerate(ctr, 0):
+                                    print(f"{i}. {trade}")
+                                    #time.sleep(0.2)
+                                    #pass
+                            return
+                            
+                        elif buy7777:
+                            print(f"buy7777 is true, ct : {ct}, cb : {cb}")
+                            self.buy_order(ct, cb, volume, con13, magic=checkTrades.magic7777)
+                            # SIVA ZONA _ BUY
+                            print("\n CLOSED TRADES :")
+                            for i, trade in enumerate(ctr, 0):
+                                    print(f"{i}. {trade}")
+                                    #time.sleep(0.2)
+                                    #pass
+                            return
+                            
+            
+
+# SELL STRATEGY :
+class sellStrategy:
+
+    def __init__(self, data, shared, parent): #, offsets, percents, risk_reward):
+        #self.order_tracker = OrderTracker()  # Create instance of OrderTracker
+        self.order_tracker = OrderTracker() #create_order_tracker
+
+        self.order_magic_map = {} 
+
+        self.data = data
+        self.parent = parent
+        self.shared = shared # sharedState()
+        
+        self.hit_levels_b = defaultdict(set) 
+        self.hit_levels_s = defaultdict(set) 
+    
+    def sell_order(self, ct, cb, volume, con13, magic):
+        """Place a sell order with parameters and log trade using Trade class."""
+        magic_number = magic #self.params_sell['magic_number']
+            
+        manMagic = magic == checkTrades.magic8881
+        specCon = magic == checkTrades.magic8008
+        stop_loss, scenario = None, 25
+
+        stop_loss = self.shared.params_sell["stop_loss_25"]
+        
+        take_profit = self.shared.params_sell['take_profit']
+
+        stop_loss_price = cb + stop_loss  # Stop loss price
+        take_profit_price = cb - take_profit  # Take profit price
+
+        # Place the sell order and get the reference
+        order = self.parent.sell(size=volume, exectype=bt.Order.Market)
+
+        # Create a Trade object for the sell order
+        trade = bt.trade.Trade(
+            data=self.data,  # Data feed
+            tradeid=order.ref,  # Use the order reference as trade ID
+            historyon=True,  # Enable history tracking
+            size=-volume,  # Size for sell (negative value)
+            price=cb,  # Price at which the trade was opened
+            value=cb * volume,  # Value of the trade
+            commission=0.01  # Example commission
+        )
+
+        # inside sell_order() before appending to shared arrays
+        open_px = float(cb)                                # entry price
+        sl_px   = float(stop_loss_price)   if stop_loss_price is not None else None
+        tp_px   = float(take_profit_price) if take_profit_price is not None else None
+
+        # freeze initial risk unit (independent of later BE SL-move)
+        if sl_px is not None:
+            ru = abs(open_px - sl_px)
+        else:
+            ru = stop_loss                    # fallback to your param
+
+        if ru <= 0:
+            ru = stop_loss                    # guard (or tiny epsilon)
+
+        trade_info = dict(
+            scenario=float(scenario),
+            action="sell",
+            lot_size=float(volume),
+            open_price=open_px,
+            close_price=float(0.0),
+            open_time=ct,
+            close_time=datetime.min,
+            stop_loss=sl_px,
+            take_profit=tp_px,
+            closed_size=0.0,
+            break_even=False,
+            current_rr=0.0,
+            levels_hit=set(),
+            max_price=0.0,
+            min_price=0.0,
+            magic_number=magic,
+            risk_reward=0.0,
+            profit=0.0
+        )
+
+        self.shared.trade_log.append(trade_info)
+        self.shared.open_trades.append(trade_info)
+
+        print(f"\n Sell Order Placed at {cb}: Lot Size: {volume}, Stop Loss: {stop_loss}, \
+              Take Profit: {take_profit}, Magic: {magic_number}")
+        return order
+    
+    def buy_close(self, volume):
+        # Sell to close buy position
+        order = self.parent.sell(size=volume, exectype=bt.Order.Market)
+        return order
+    
+    def sell_close(self, volume):
+        # Buy to close sell position
+        order = self.parent.buy(size=volume, exectype=bt.Order.Market)
+        return order
+
+    def next(self):
+
+        timeframeM1, timeframeM15, timeframeM30, timeframeH1, timeframeH4 = "M1", "M15", "M30", "H1", "H4"
+
+        ot = self.order_tracker
+        tl = self.shared.trade_log
+        otr = self.shared.open_trades
+        ctr = self.shared.closed_trades
+
+        m1_index = self.shared.m1_index
+
+        m1_last = m1_index -1 #promenio si m1_index gore
+
+        holiday     = self.shared.holiday
+
+        if holiday:
+            print(" --- HOLIDAY TIME - NO TRADING --- ")
+            return
+
+        data = CandleData2(self.shared.csv_paths)
+
+        # full candle dict (for prices etc.)
+        candles_current_time = data.get_candle("M1", m1_index)
+
+        # cb : open price of current M1 candle
+        cb = self.shared.cb #candles_current_time['Open']
+        ch = self.shared.ch #candles_current_time['High']
+
+        # ct : naive datetime of current M1 candle
+        ct_datetime = self.shared.ct #data.get_ct("M1", m1_index)   # already tz-naive
+        ct = ct_datetime
+        st = self.shared.st #ct - timedelta(hours=3)
+
+        con13 = self.shared.con13
+        checkOOB, checkOOS = self.shared.checkOOB, self.shared.checkOOS
+        #bis1, doji1, man1s, _ = self.shared.bis1, self.shared.doji1, self.shared.man1s, None
+        volume = self.shared.params_sell['lot_size']
+
+        ctr.sort(key=lambda trade: trade['open_time'], reverse=True)
+
+        # I actually dont use it but it helps :
+        liqBuy = self.shared.liqBuy
+        B1 = self.shared.B1 
+        B2 = self.shared.B2 
+        liqSell = self.shared.liqSell
+        S1 = self.shared.S1
+        S2 = self.shared.S2
+
+        liqBuy_D = self.shared.liqBuy_D
+        B1_D = self.shared.B1_D
+        B2_D = self.shared.B2_D
+        liqSell_D = self.shared.liqSell_D
+        S1_D = self.shared.S1_D
+        S2_D = self.shared.S2_D   
+
+        self.shared.sell8889, self.shared.sell8888 = None, None    
+
+        # SELL STRATEGY:
+
+        c_p         = self.shared.csv_paths
+        negTrades   = self.shared.negTrades  
+        negT_S      = self.shared.negT_S
+        isTime      = self.shared.isTime 
+        news15      = self.shared.news15   
+        
+
+        liq15_S              = self.shared.liq15_S # numpy_liquidity.liqS_15(tl, ot, cb, ct, st, m1_index
+        ear_dt, ear_type     = self.shared.ear_dt, self.shared.ear_type
+        zS_dt                = self.shared.zS_dt
+        vremeZ_dt_S          = self.shared.vremeZ_dt_S
+        hcsBig_dt            = self.shared.hcsBig_dt
+        sellBig_dt           = self.shared.sellBig_dt
+        cOS_dt, cOS_price    = self.shared.cOS_dt, self.shared.cOS_price
+        is3man               = self.shared.is3man
+        zPendS               = None
+        mms                  = self.shared.mms
+        allowVol_S_M1        = True #numpy_permission.allowVolatility_S_M1(m1_index, checkOOS, negT_S)
+        allowVol_S           = numpy_permission.allowVolatilityS(self.shared.csv_paths, m1_index-1)
+        allowTradeS1         = checkOOS <= 0
+        allowTradeS2         = \
+        numpy_permission.allowTradeS2(cb, st, vremeZ_dt_S, ear_dt, ear_type, zS_dt, checkOOB, checkOOS, cOS_price, mms)
+        prev_ci15, prev_ci30 = self.shared.prev_ci15, self.shared.prev_ci30
+        forbid_ree      = self.shared.forbid_ree
+        ciH1 = self.shared.ciH1
+        ciD1 = self.shared.ciD1
+
+
+        print(f" \n currOS_dt : {cOS_dt}, currOS_price : {cOS_price} \n \
+              mms : {mms},  checkOOB : {checkOOB}, checkOOS : {checkOOS} \n \
+              allowTradeS1 : {allowTradeS1}, allowTradeS2 : {allowTradeS2} \n \
+                allowVol_S_M1 : {allowVol_S_M1}, allowVol_S : {allowVol_S} \n ")
+
+        if not holiday:
+            
+
+            if isTime: # MAN_BUY, buy7777, 7778, 7700, 7701, 7702, 7070(R) :
+
+                print(f"BS: istime true is true, cb: {cb}, ct : {ct}, islastrange : {timeFilter.isLastRange(ct)}")
+
+            if allowVol_S_M1 and allowVol_S:
+
+                    if allowTradeS1:
+
+                        scon     = numpy_permission.sellCondition(c_p, cb, prev_ci15, prev_ci30, \
+                                   liqSell, liqSell_D, vremeZ_dt_S, ear_dt, ear_type, hcsBig_dt, sellBig_dt, zS_dt, zPendS, st)   
+                        specS = None #SPEC.specialCommand_S(c_p, S1, S1_D, cb, ch, ct, ciH1, ciD1)
+                        scon2    = numpy_permission.is_sell_condition_2(checkOOB, checkOOS, specS, liq15_S, scon)
+
+                        print(f"scon : {scon}")
+                        print(f"Scon2 : {scon2})")
+
+                        sell8888 = numpy_permission.sell8888(False, True, scon, scon2)
+                        sell8800 = numpy_permission.sell8800(True, scon, scon2) 
+                        self.shared.sell8888 = sell8888
+
+                        if sell8800:
+                            print(f"sell8800 is true, ct : {ct}, cb : {cb}")
+                            self.sell_order(ct, cb, volume, con13, magic=checkTrades.magic8800)
+                            print("\n✅ CLOSED TRADES :")
+                            for i, trade in enumerate(ctr, 0):
+                                    print(f"{i}. {trade}")
+                                    #time.sleep(0.2)
+                                    #pass
+                            return
+                            
+                        elif sell8888:
+                            print(f"sell8888 is true, ct : {ct}, cb : {cb}")
+                            self.sell_order(ct, cb, volume, con13, magic=checkTrades.magic8888)
+                            print("\n✅ CLOSED TRADES :")
+                            for i, trade in enumerate(ctr, 0):
+                                    print(f"{i}. {trade}")
+                                    #time.sleep(0.2)
+                                    #pass
+                            return
+  
