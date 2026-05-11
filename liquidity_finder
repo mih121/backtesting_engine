@@ -1,0 +1,381 @@
+from __future__ import annotations
+from typing import Callable, Dict, Optional, Tuple
+import numpy as np
+import numpy as np
+from datetime import datetime
+import conditionsForLiq, conditionsForLiq_live, learning10_new
+from learning3_data import CandleData2
+#from numpy_learn import CandleData2
+from checkTrades import OrderTracker
+import time
+from collections import deque
+from typing import Optional
+from timeFilter import newsRange
+# liq_live.py
+
+
+#ot = OrderTracker
+#tfH1, tfH4 = "H1", "H4"
+
+WINDOWS = {
+    'M15' : 600, 
+    'M30' : 150, 
+    'H1': 600,
+    'H4': 150,
+    'D1': 150,
+}
+
+
+RAZMAKS = {
+    'M15' : 0.00065, # 3.0 XAUUSD
+    'M30' : 0.0009, # 3.0 XAUUSD
+    'H1': 0.0009,   # UMESTO 0.0001 5.5 XAUUSD,
+    'H4': 0.0010,   # 5.5 XAUUSD,
+    'D1': 0.0015,   # 5.5 XAUUSD,
+}
+
+RAZMAKICS = {
+    'M15' : 0.0,    # 0.1 XAUUSD
+    'M30' : 0.0,    # 0.1 XAUUSD
+    'H1': 0.0001,   # 0.5 XAUUSD
+    'H4': 0.0001,   # 0.5 XAUUSD
+    'D1': 0.0001,   # 0.5 XAUUSD
+}
+
+import os
+MONTH_TAG = os.getenv("MONTH_TAG", "mar24")
+
+def to_scalar(thr):
+    # turn numpy arrays into a single float, or None if empty
+    if isinstance(thr, np.ndarray):
+        return None if thr.size == 0 else float(thr.flat[0])
+    # if it’s already a float (or int), just cast
+    try:
+        return float(thr)
+    except:
+        return None
+
+class LiquidityScanner:
+    """
+    Same as before, but now we only build zones when file1.function1(tf, q) == True.
+    """
+    tfH1, tfH4, tfD1 = "H1", "H4", "D1"
+    PERIOD_MINUTES   = {tfH1: 60, tfH4: 240, tfD1: 1440}
+
+    def __init__(self, csv_paths):
+        import os
+
+        cache_dir = "cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        #cache_file = os.path.join(cache_dir, "liqudity_H1H4D1_station_mar24.npz")
+
+        cache_file = os.path.join(cache_dir, f"liqudity_H1H4D1_station_{MONTH_TAG}.npz")
+
+        # 0) try to load from cache
+        if os.path.exists(cache_file):
+            data = np.load(cache_file, allow_pickle=True)
+
+            self.m1_lows   = data["m1_lows"]
+            self.m1_highs  = data["m1_highs"]
+            self.m1_times  = data["m1_times"]
+            self.h1_times  = data["h1_times"]
+            self.h4_times  = data["h4_times"]
+            self.d1_times  = data["d1_times"]
+
+            self.zones     = data["zones"]
+            self.zones_s   = data["zones_s"]
+            self.idx1      = data["idx1"]
+            self.idx1_s    = data["idx1_s"]
+
+            print("cache: B: Built zones LIQ _ H1/H4 (tf, q, p1, side, close_time):")
+            for tf, q, p1, p2, open_time, close_time in self.zones:
+                ct_str = np.datetime_as_string(close_time, unit='s')
+                print(f"{tf:>3} | q={q:4d} | p1={p1:8.4f} | open_time={open_time:>4s} | close_time={ct_str}")
+
+            print("cache: S: Built zones LIQ _ H1/H4 (tf, q, p1_s, side, close_time):")
+            for tf, q, p1_s, p2_s, open_time, close_time in self.zones_s:
+                ct_str = np.datetime_as_string(close_time, unit='s')
+                print(f"{tf:>3} | q={q:4d} | p1_s={p1_s:8.4f} | open_time={open_time:>4s} | close_time={ct_str}")
+
+            return
+
+        # 1) raw M1 lows & times (slow path – first build)
+        cd = CandleData2(csv_paths)
+
+        m1             = cd.data['M1']
+        self.m1_lows   = np.array(m1['Low'],      dtype=float)
+        self.m1_highs  = np.array(m1['High'],     dtype=float)
+        self.m1_times  = np.array(m1['Datetime'], dtype='datetime64[s]')
+
+        self.h1_times  = np.array(cd.data[self.tfH1]['Datetime'],  dtype='datetime64[s]')
+        self.h4_times  = np.array(cd.data[self.tfH4]['Datetime'],  dtype='datetime64[s]')
+        self.d1_times  = np.array(cd.data[self.tfD1]['Datetime'],  dtype='datetime64[s]')
+
+        # 2) build zones only when file1.function1 says so
+        recs_b = []
+        recs_s = []
+
+        for tf, dur in self.PERIOD_MINUTES.items():
+            lows   = np.array(cd.data[tf]['Low'],      dtype=float)
+            highs  = np.array(cd.data[tf]['High'],     dtype=float)
+            times  = np.array(cd.data[tf]['Datetime'], dtype='datetime64[s]')
+            raz    = RAZMAKS[tf]
+            raz_ic = RAZMAKICS[tf]
+
+            for q, (lw, t0) in enumerate(zip(lows, times)):
+                if not conditionsForLiq.liq_B(csv_paths, tf, q):
+                    continue
+
+                open_time  = t0
+                close_time = t0 + np.timedelta64(self.PERIOD_MINUTES[tf], 'm')
+                p1 = lw - raz_ic
+                p2 = lw - raz
+
+                recs_b.append((tf, q, p1, p2, open_time, close_time))
+
+            for q, (hih, t0) in enumerate(zip(highs, times)):
+                if not conditionsForLiq.liq_S(csv_paths, tf, q):
+                    continue
+
+                open_time  = t0
+                close_time = t0 + np.timedelta64(self.PERIOD_MINUTES[tf], 'm')
+                p1 = hih + raz_ic
+                p2 = hih + raz
+
+                recs_s.append((tf, q, p1, p2, open_time, close_time))
+
+        dtype = [
+            ('tf',        'U3'),
+            ('q',         'i4'),
+            ('p1',        'f8'),
+            ('p2',        'f8'),
+            ('open_time','datetime64[s]'),
+            ('close_time','datetime64[s]'),
+        ]
+        self.zones   = np.array(recs_b,   dtype=dtype)
+        self.zones_s = np.array(recs_s, dtype=dtype)
+
+        self.zones   = np.sort(self.zones,   order='close_time')[::-1]
+        self.zones_s = np.sort(self.zones_s, order='close_time')[::-1]
+
+        # 3) precompute the M1-indices of each zone’s close
+        self.idx1   = np.searchsorted(self.m1_times, self.zones['close_time'])
+        self.idx1_s = np.searchsorted(self.m1_times, self.zones_s['close_time'])
+
+        # save to cache
+        np.savez_compressed(
+            cache_file,
+            m1_lows=self.m1_lows,
+            m1_highs=self.m1_highs,
+            m1_times=self.m1_times,
+            h1_times=self.h1_times,
+            h4_times=self.h4_times,
+            d1_times=self.d1_times,
+            zones=self.zones,
+            zones_s=self.zones_s,
+            idx1=self.idx1,
+            idx1_s=self.idx1_s,
+        )
+
+        print("cache: B: Built zones LIQ _ H1/H4 (tf, q, p1, side, close_time):")
+        for tf, q, p1, p2, open_time, close_time in self.zones:
+            ct_str = np.datetime_as_string(close_time, unit='s')
+            print(f"{tf:>3} | q={q:4d} | p1={p1:8.4f} | open_time={open_time:>4s} | close_time={ct_str}")
+
+        print("cache: S: Built zones LIQ _ H1/H4 (tf, q, p1_s, side, close_time):")
+        for tf, q, p1_s, p2_s, open_time, close_time in self.zones_s:
+            ct_str = np.datetime_as_string(close_time, unit='s')
+            print(f"{tf:>3} | q={q:4d} | p1_s={p1_s:8.4f} | open_time={open_time:>4s} | close_time={ct_str}")
+
+    # za live:
+    def on_new_tf_candle(self, tf: str):
+        """Call this ONLY when isNewH1 / isNewH4 is True."""
+        cd = self.cd
+
+        lows  = np.array(cd.data[tf]['Low'],      dtype=float)
+        highs = np.array(cd.data[tf]['High'],     dtype=float)
+        times = np.array(cd.data[tf]['Datetime'], dtype='datetime64[s]')
+        raz    = self.RAZMAKS[tf]
+        raz_ic = self.RAZMAKICS[tf]
+
+        # *** only last index q ***
+        q  = len(lows) - 1 # it is nicely indexed here !
+        lw = lows[q]
+        hih = highs[q]
+        t0 = times[q]
+
+        # BUY pattern
+        if conditionsForLiq.liq_B(self.csv_paths, tf, q):
+            open_time  = t0
+            close_time = t0 + np.timedelta64(self.PERIOD_MINUTES[tf], 'm')
+            p1 = lw - raz_ic
+            p2 = lw - raz
+            self.recs_b.append((tf, q, p1, p2, open_time, close_time))
+
+        # SELL pattern
+        if conditionsForLiq.liq_S(self.csv_paths, tf, q):
+            open_time  = t0
+            close_time = t0 + np.timedelta64(self.PERIOD_MINUTES[tf], 'm')
+            p1 = hih + raz_ic
+            p2 = hih + raz
+            self.recs_s.append((tf, q, p1, p2, open_time, close_time))
+
+    def find_liq(self, 
+                 m1_idx: int,
+                 cb_price: float,
+                 ciH1: int = None,
+                 ciH4: int = None):
+
+
+         ... using numpy library for fast liquidity finder for big timeframes
+
+    def find_liq_D(self,
+                 ct: datetime,
+                 m1_idx: int,
+                 cb_price: float,
+                 ciD1: int = None):
+
+         ... using numpy library for fast liquidity finder for big timeframes
+
+class LiquidityScanner_M15:
+    tfM15, tfM30 = "M15", "M30"
+    PERIOD_MINUTES = {tfM15: 15, tfM30: 30}
+
+    def __init__(self, csv_paths):
+        import os
+
+        cache_dir = "cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        #cache_file = os.path.join(cache_dir, "liquidity_M15_station_mar24.npz")
+
+        cache_file = os.path.join(cache_dir, f"liquidity_M15_station_{MONTH_TAG}.npz")
+
+        # 0) try to load from cache
+        if os.path.exists(cache_file):
+            data = np.load(cache_file, allow_pickle=True)
+
+            self.m1_lows   = data["m1_lows"]
+            self.m1_highs  = data["m1_highs"]
+            self.m1_times  = data["m1_times"]
+            self.m15_times = data["m15_times"]
+            self.m30_times = data["m30_times"]
+
+            self.zones     = data["zones"]
+            self.zones_s   = data["zones_s"]
+            self.idx1      = data["idx1"]
+            self.idx1_s    = data["idx1_s"]
+
+            print("cache: B: Built zones LIQ _ M15/30 (tf, q, p1, side, close_time):")
+            for tf, q, p1, p2, open_time, close_time in self.zones:
+                ct_str = np.datetime_as_string(close_time, unit='s')
+                print(f"{tf:>3} | q={q:4d} | p1={p1:8.4f} | open_time={open_time:>4s} | close_time={ct_str}")
+
+            print("cache: S: Built zones LIQ _ M15/30 (tf, q, p1_s, side, close_time):")
+            for tf, q, p1_s, p2_s, open_time, close_time in self.zones_s:
+                ct_str = np.datetime_as_string(close_time, unit='s')
+                print(f"{tf:>3} | q={q:4d} | p1_s={p1_s:8.4f} | side={open_time:>4s} | close_time={ct_str}")
+
+            return
+
+        # 1) raw M1 lows & times (slow path – first build)
+        cd = CandleData2(csv_paths)
+
+        m1             = cd.data['M1']
+        self.m1_lows   = np.array(m1['Low'],      dtype=float)
+        self.m1_highs  = np.array(m1['High'],     dtype=float)
+        self.m1_times  = np.array(m1['Datetime'], dtype='datetime64[s]')
+
+        self.m15_times = np.array(cd.data[self.tfM15]['Datetime'], dtype='datetime64[s]')
+        self.m30_times = np.array(cd.data[self.tfM30]['Datetime'], dtype='datetime64[s]')
+
+        # 2) build zones only when file1.function1 says so
+        recs_b = []
+        recs_s = []
+
+        for tf, dur in self.PERIOD_MINUTES.items():
+            lows   = np.array(cd.data[tf]['Low'],      dtype=float)
+            highs  = np.array(cd.data[tf]['High'],     dtype=float)
+            times  = np.array(cd.data[tf]['Datetime'], dtype='datetime64[s]')
+            raz    = RAZMAKS[tf]
+            raz_ic = RAZMAKICS[tf]
+
+            # BUY zones (based on lows)
+            for q, (lw, t0) in enumerate(zip(lows, times)):
+                if not conditionsForLiq.bearishHCS_LIQ(csv_paths, tf, q):
+                    continue
+                open_time  = t0
+                close_time = t0 + np.timedelta64(dur, 'm')
+                p1 = lw + raz_ic  # intentionally plus
+                p2 = lw - raz
+                recs_b.append((tf, q, p1, p2, open_time, close_time))
+
+            # SELL zones (based on highs)
+            for q, (hi, t0) in enumerate(zip(highs, times)):
+                if not conditionsForLiq.bullishHCS_LIQ(csv_paths, tf, q):
+                    continue
+                open_time  = t0
+                close_time = t0 + np.timedelta64(dur, 'm')
+                p1 = hi - raz_ic   # intentionally minus
+                p2 = hi + raz
+                recs_s.append((tf, q, p1, p2, open_time, close_time))
+
+        dtype = [
+            ('tf',        'U3'),
+            ('q',         'i4'),
+            ('p1',        'f8'),
+            ('p2',        'f8'),
+            ('open_time', 'datetime64[s]'),
+            ('close_time','datetime64[s]'),
+        ]
+        self.zones   = np.array(recs_b,   dtype=dtype)
+        self.zones_s = np.array(recs_s, dtype=dtype)
+
+        self.zones   = np.sort(self.zones,   order='close_time')[::-1]
+        self.zones_s = np.sort(self.zones_s, order='close_time')[::-1]
+
+        # 3) precompute the M1-indices of each zone’s close
+        self.idx1   = np.searchsorted(self.m1_times, self.zones['close_time'])
+        self.idx1_s = np.searchsorted(self.m1_times, self.zones_s['close_time'])
+
+        # save to cache
+        np.savez_compressed(
+            cache_file,
+            m1_lows=self.m1_lows,
+            m1_highs=self.m1_highs,
+            m1_times=self.m1_times,
+            m15_times=self.m15_times,
+            m30_times=self.m30_times,
+            zones=self.zones,
+            zones_s=self.zones_s,
+            idx1=self.idx1,
+            idx1_s=self.idx1_s,
+        )
+
+        print("cache: B: Built zones LIQ _ M15/30 (tf, q, p1, side, close_time):")
+        for tf, q, p1, p2, open_time, close_time in self.zones:
+            ct_str = np.datetime_as_string(close_time, unit='s')
+            print(f"{tf:>3} | q={q:4d} | p1={p1:8.4f} | open_time={open_time:>4s} | close_time={ct_str}")
+
+        print("cache: S: Built zones LIQ _ M15/30 (tf, q, p1_s, side, close_time):")
+        for tf, q, p1_s, p2_s, open_time, close_time in self.zones_s:
+            ct_str = np.datetime_as_string(close_time, unit='s')
+            print(f"{tf:>3} | q={q:4d} | p1_s={p1_s:8.4f} | side={open_time:>4s} | close_time={ct_str}")
+
+   def find_liqM15_B_S(
+          self,
+          m1_idx: int,
+          ct: datetime = None,
+          cb: float = None,
+          st: datetime = None,
+          ciM15: int = None,
+          ciM30: int = None,
+          z1: Optional[float] = None,
+          z1_d: Optional[float] = None,
+          z1s: Optional[float] = None,
+          z1s_d: Optional[float] = None,
+          zB_dt: datetime = None,
+          zS_dt: datetime = None,
+          debug: bool = False,
+      ):
+
+      ... by using numpy library define m15, m30 and m45 liquidity
