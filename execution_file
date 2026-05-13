@@ -24,26 +24,26 @@ class sharedState:
 
     params_buy = dict(
         lot_size=1.0,
-        stop_loss_18    = 0.0003303, # 3.3 pips
-        stop_loss_25    = 0.0003303,
-        stop_loss_spec  = 0.0003303,
+        stop_loss_98    = x.x, # x.x pips
+        stop_loss_99    = x.x,
+        stop_loss_spec  = x.x,
 
-        offsets  = np.array([-0.0003303, 2.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0], dtype=float),
-        percents = np.array([ -1.0,      0.0, 0.15, 0.28, 0.28, 0.19,  0.1, 0.1], dtype=float),
-        rr       = np.array([ -1.0,      0.0,  2.0,  7.0, 13.5, 20.0, 25.5, 32.5], dtype=float),
+        offsets  = np.array([-x.x,  x.x,  x.x,  x.x,  x.x,  x.x,  x.x, x.x], dtype=float),
+        percents = np.array([ -1.0, x.x,  x.x,  x.x,  x.x,  x.x,  x.x, x.x], dtype=float),
+        rr       = np.array([ -1.0, x.x,  x.x,  x.x,  x.x,  x.x,  x.x, x.x], dtype=float),
 
         take_profit=50.0,    # Default take profit in points
     )
 
     params_sell = dict(
         lot_size=1.0,
-        stop_loss_18    = 0.0003303, # 3.3 pips
-        stop_loss_25    = 0.0003303,
-        stop_loss_spec  = 0.0003303,
+        stop_loss_98    = x.x, # x.x pips
+        stop_loss_99    = x.x,
+        stop_loss_spec  = x.x,
 
-        offsets  = np.array([-0.0003303, 2.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0], dtype=float),
-        percents = np.array([ -1.0,      0.0, 0.15, 0.28, 0.28, 0.19,  0.1, 0.1], dtype=float),
-        rr       = np.array([ -1.0,      0.0,  2.0,  7.0, 13.5, 20.0, 25.5, 32.5], dtype=float),
+        offsets  = np.array([-x.x,  x.x,  x.x,  x.x,  x.x,  x.x,  x.x, x.x], dtype=float),
+        percents = np.array([ -1.0, x.x,  x.x,  x.x,  x.x,  x.x,  x.x, x.x], dtype=float),
+        rr       = np.array([ -1.0, x.x,  x.x,  x.x,  x.x,  x.x,  x.x, x.x], dtype=float),
 
         take_profit=50.0,    # Default take profit in points
     )
@@ -94,8 +94,7 @@ class MasterStrategy(bt.Strategy):
         self.sell_mgr.next()
         # self.sell_mgr.next()
 
-
-...
+        ...
 
 if __name__ == '__main__':
     # Create a cerebro entity
@@ -110,13 +109,13 @@ if __name__ == '__main__':
 
     cerebro.broker.setcash(100000.0)
 
-    # Set the commission - 0.1% ... divide by 100 to remove the %
+    # seting the commission - 0.1% ... divide by 100 to remove the %
     cerebro.broker.setcommission(commission=0.001)
 
-    # Print out the starting conditions
+    # print out the starting conditions
     print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
 
-    # Run over everything
+    # run over everything
     cerebro.addwriter(bt.WriterFile, out='run_log.csv', csv=True)
     cerebro.run()
 
